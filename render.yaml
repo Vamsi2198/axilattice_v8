@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: axilattice
+    runtime: static
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./build
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # react-scripts treats lint warnings as errors when CI is truthy.
+      # The tree is warning-clean, but an upstream lint rule change should not
+      # be able to break a deploy.
+      - key: CI
+        value: "false"
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
