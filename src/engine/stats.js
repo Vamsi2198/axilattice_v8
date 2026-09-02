@@ -346,6 +346,39 @@ export function persistenceTest(hits, periods, members) {
   };
 }
 
+/**
+ * Welch's two-sample t-test from sufficient statistics alone.
+ *
+ * Takes {n, sum, sumSq} for each group -- no raw values -- which is exactly
+ * what a cube cell already stores. Welch rather than Student because the two
+ * groups here are a cell and everything else, and their variances are never
+ * equal.
+ */
+export function welchFromStats(a, b) {
+  if (!(a.n > 1) || !(b.n > 1)) {
+    return { testable: false, reason: `needs > 1 row per side, got ${a.n} and ${b.n}` };
+  }
+  const m1 = a.sum / a.n, m2 = b.sum / b.n;
+  const v1 = (a.sumSq - (a.sum * a.sum) / a.n) / (a.n - 1);
+  const v2 = (b.sumSq - (b.sum * b.sum) / b.n) / (b.n - 1);
+  if (!(v1 >= 0) || !(v2 >= 0) || (v1 === 0 && v2 === 0)) {
+    return { testable: false, reason: "zero variance on both sides" };
+  }
+  const se2 = v1 / a.n + v2 / b.n;
+  if (!(se2 > 0)) return { testable: false, reason: "degenerate standard error" };
+  const t = (m1 - m2) / Math.sqrt(se2);
+  // Welch-Satterthwaite degrees of freedom
+  const df = (se2 * se2) /
+    (((v1 / a.n) ** 2) / (a.n - 1) + ((v2 / b.n) ** 2) / (b.n - 1));
+  const pooledSd = Math.sqrt(((a.n - 1) * v1 + (b.n - 1) * v2) / (a.n + b.n - 2));
+  return {
+    testable: true, test: "welch-t", t, df, p: studentTP(t, df),
+    mean1: m1, mean2: m2, diff: m1 - m2,
+    effect: pooledSd > 0 ? (m1 - m2) / pooledSd : null,
+    n1: a.n, n2: b.n,
+  };
+}
+
 /* ─── MULTIPLE COMPARISONS ───────────────────────────────────────────────── */
 
 /**

@@ -4,16 +4,16 @@
    guards that stop a large file from taking the tab down.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-import { parseCSV } from "./csv.js";
-import { profile } from "./profile.js";
-import { buildCube, estimateCubeBytes } from "./cube.js";
-
 export * from "./stats.js";
 export * from "./csv.js";
 export * from "./profile.js";
 export * from "./cube.js";
 export * from "./query.js";
 export * from "./insights.js";
+
+import { parseCSV } from "./csv.js";
+import { profile } from "./profile.js";
+import { buildCube, estimateCubeBytes } from "./cube.js";
 
 export const ENGINE_VERSION = "engine/1.0.0";
 

@@ -27,12 +27,13 @@
 import {
   grubbsTest, lastPointTest, benjaminiHochberg, robustZScores,
   cohenD, contributionDecomposition, mixRateDecomposition,
-  persistenceTest,
+  persistenceTest, welchFromStats,
 } from "./stats.js";
 import {
-  queryBreakdown, queryTrend, queryCrossBreakdown, allPeriods,
+  queryBreakdown, queryTrend, allPeriods,
   latestPeriod, resolveGrain, queryPeriodPair, queryRaw, findCrossCombo,
 } from "./query.js";
+import { SEP } from "./cube.js";
 
 export const INSIGHTS_VERSION = "insights/1.0.0";
 
@@ -51,6 +52,9 @@ export const DISCOVERY_DEFAULTS = {
   minPersistPeriods: 6,// panel length before a rank-persistence test is run
   minHistory: 5,       // periods of history before a temporal claim
   maxTests: 200000,    // safety valve on pathological schemas
+  maxFeed: 30,         // cards produced on connect
+  maxPerPair: 2,       // findings per measure per dimension (or dimension pair)
+  maxPerValue: 3,      // findings per measure mentioning the same member
 };
 
 /* ─── SUPPORT FILTERING ──────────────────────────────────────────────────── */
@@ -206,7 +210,13 @@ function persistenceCandidates(cube, measure, dim, grain, period, cfg) {
     });
   };
   for (const [label, hits] of Array.from(topHits.entries()).sort()) emit(label, hits, "top");
-  for (const [label, hits] of Array.from(bottomHits.entries()).sort()) emit(label, hits, "bottom");
+  // On a two-member dimension the bottom is the complement of the top, so
+  // "Standard is always highest" and "Express is always lowest" are one fact
+  // written twice. Emitting both put four cards on the feed that were really
+  // two. Above two members the bottom is genuinely separate information.
+  if (memberCount > 2) {
+    for (const [label, hits] of Array.from(bottomHits.entries()).sort()) emit(label, hits, "bottom");
+  }
   return out;
 }
 
@@ -224,63 +234,82 @@ function persistenceCandidates(cube, measure, dim, grain, period, cfg) {
  * p-value and no place in the FDR pool. It appears on the card marked as such.
  */
 function crossCandidates(cube, measure, dimA, dimB, grain, period, cfg, meta) {
-  if (!findCrossCombo(cube, dimA, dimB)) return [];
-  const rows = queryCrossBreakdown(cube, dimA, dimB, measure, grain, period);
-  if (rows.length < 4) return [];
-  if (cube.meta.aggOf?.[measure] === "avg") return []; // independence model is additive-only
+  const combo = findCrossCombo(cube, dimA, dimB);
+  if (!combo) return [];
+  const pk = period || latestPeriod(cube, grain);
+  const bucket = cube.cells[grain]?.[combo]?.[pk] || {};
+  const keys = Object.keys(bucket);
+  if (keys.length < 4) return [];
 
-  // Dispersion index from the profiler; null when the measure can go negative,
-  // in which case no independence model applies and we stay descriptive.
-  const phi = meta?.dispersionIndex != null && meta.dispersionIndex > 0
-    ? Math.max(1, meta.dispersionIndex) : null;
-
-  const marginA = new Map(), marginB = new Map();
-  let grand = 0;
-  for (const r of rows) {
-    marginA.set(r.a, (marginA.get(r.a) || 0) + r.value);
-    marginB.set(r.b, (marginB.get(r.b) || 0) + r.value);
-    grand += r.value;
+  /* WHY THIS TEST CHANGED.
+   *
+   * The previous version compared each cell's measure TOTAL against what
+   * independence of the marginal totals predicts. On a real file that produced
+   * six near-identical cards: DS-07 x rating=2 was "over-represented" on
+   * order_value at 6.4x, on delivery_min at 4.3x, and on items at 5.9x.
+   *
+   * Those are not three findings. They are one finding -- more rows land in
+   * that cell than independence predicts -- restated once per measure, because
+   * every additive total inherits the row-count imbalance. Reporting it three
+   * times both clutters the feed and implies three independent pieces of
+   * evidence for something the data said once.
+   *
+   * So the test now asks the question people actually mean: conditional on how
+   * many rows are in this cell, is the AVERAGE unusual? "Deliveries from DS-07
+   * at night take longer" is a claim about a mean. A Welch t-test of the cell
+   * against everything else answers it directly, is correctly specified for a
+   * continuous measure, and is computable entirely from the aggregates the
+   * cube already holds. Row-count imbalance is a separate fact and gets its
+   * own separate test below.
+   */
+  const grand = { n: 0, sum: 0, sumSq: 0 };
+  const cells = [];
+  for (const key of keys) {
+    const c = bucket[key]?.[measure];
+    if (!c || !c.count) continue;
+    grand.n += c.count; grand.sum += c.sum; grand.sumSq += c.sumSq || 0;
+    const idx = key.indexOf(SEP);
+    cells.push({ key, a: key.slice(0, idx), b: key.slice(idx + 1), c });
   }
-  if (!(grand > 0)) return [];
+  if (!grand.n || !(grand.sumSq > 0)) return [];
 
   const out = [];
-  for (const r of rows) {
-    if (r.n < cfg.minCellRows) continue;
-    if (r.value / grand < cfg.minShare) continue;
-    const expected = (marginA.get(r.a) * marginB.get(r.b)) / grand;
-    if (!(expected > 0)) continue;
-    const lift = r.value / expected;
-    const base = {
-      kind: "cross", measure, dimA, dimB, a: r.a, b: r.b, grain, period,
-      val: r.value, n: r.n, expected, lift, log2Lift: Math.log2(lift),
-      share: r.value / grand,
+  for (const cell of cells) {
+    if (cell.c.count < cfg.minCellRows) continue;
+    const rest = {
+      n: grand.n - cell.c.count,
+      sum: grand.sum - cell.c.sum,
+      sumSq: grand.sumSq - (cell.c.sumSq || 0),
     };
-    if (phi != null) {
-      // QUASI-POISSON RESIDUAL.
-      //
-      // The plain Pearson residual (O - E)/sqrt(E) assumes Var(O) = E, which
-      // is only true for a Poisson count. Applied to revenue it inflated the
-      // statistic by a factor of five and fired on 23 cells of a dataset with
-      // no planted effect at all. That is the same class of error this engine
-      // exists to catch, committed by the engine itself.
-      //
-      // The fix is exact rather than a fudge. For a measure that is a sum of
-      // iid draws, Var(sum) = n*sigma^2 and E[sum] = n*mu, so
-      // Var(O) = (sigma^2/mu) * E = phi * E, where phi is the dispersion
-      // index computed once in the profiler. Dividing by sqrt(phi*E) makes the
-      // residual correctly scaled for ANY non-negative additive measure, and
-      // collapses to the classic Pearson residual when phi = 1.
-      const resid = (r.value - expected) / Math.sqrt(phi * expected);
-      out.push({ ...base, test: "quasi-poisson-residual", statistic: resid, dispersion: phi,
-        p: Math.min(1, 2 * (1 - normalCdfLocal(Math.abs(resid)))) });
-    } else {
-      out.push({ ...base, test: "descriptive-lift", statistic: Math.log2(lift),
-        p: null, descriptiveOnly: true,
-        note: `${measure} takes negative values, so the independence model does not apply. This is an effect size, not evidence.` });
-    }
+    const w = welchFromStats(
+      { n: cell.c.count, sum: cell.c.sum, sumSq: cell.c.sumSq || 0 }, rest);
+    if (!w.testable) continue;
+    out.push({
+      kind: "cross", measure, dimA, dimB, a: cell.a, b: cell.b, grain, period: pk,
+      val: w.mean1, restMean: w.mean2, n: cell.c.count,
+      share: grand.sum ? cell.c.sum / grand.sum : 0,
+      test: "welch-t", statistic: w.t, p: w.p, effect: w.effect,
+      lift: w.mean2 ? w.mean1 / w.mean2 : null,
+      direction: w.diff > 0 ? "above" : "below",
+    });
   }
-  out.sort((x, y) => Math.abs(y.log2Lift) - Math.abs(x.log2Lift));
-  return out.slice(0, 6);
+  /* EVERY tested cell goes into the pool, including the boring ones.
+   *
+   * The first version of this sorted by effect size and kept the top three,
+   * then handed their raw p-values to the FDR step. That is selection: you
+   * cannot go looking for the largest of forty cells and then report its
+   * nominal p-value as though you had picked it in advance. It is the same
+   * error the fixed z-threshold made, one level up -- and the null-dataset
+   * test caught it immediately, firing on region=East x segment=Mid in data
+   * with no planted effect at all.
+   *
+   * Returning everything is the honest fix: the tests were genuinely run, so
+   * they belong in the denominator. Benjamini-Hochberg then prices the search
+   * correctly, and the feed's diversity selector decides what gets DISPLAYED
+   * from among what survived -- which is a presentation choice made after the
+   * statistics, not a shortcut taken before them.
+   */
+  return out;
 }
 
 function normalCdfLocal(z) {
@@ -312,6 +341,9 @@ export function discoverInsights(cube, options = {}) {
     const measure = m.col;
     for (const dim of dims) {
       if (tests > cfg.maxTests) break;
+      // A dual-role column must never be tested against itself. "tip = 30 is
+      // extreme on tip" is true by construction and tells you nothing.
+      if (dim === measure) continue;
       for (const c of siblingCandidates(cube, measure, dim, grain, period, cfg)) {
         if (c.untestable) untestable.push(c); else { candidates.push(c); tests++; }
       }
@@ -324,6 +356,7 @@ export function discoverInsights(cube, options = {}) {
     }
     for (let i = 0; i < dims.length; i++) {
       for (let j = i + 1; j < dims.length; j++) {
+        if (dims[i] === measure || dims[j] === measure) continue;
         for (const c of crossCandidates(cube, measure, dims[i], dims[j], grain, period, cfg, m)) {
           candidates.push(c);
           if (c.p != null) tests++;
@@ -339,21 +372,57 @@ export function discoverInsights(cube, options = {}) {
   tested.forEach((c, i) => { c.q = qs[i]; c.significant = qs[i] <= cfg.fdrQ; });
 
   const survivors = tested.filter((c) => c.significant);
-  // Rank surviving findings by effect size, not by p-value. A tiny p on a
-  // trivial effect is a large sample, not an important fact.
-  survivors.sort((a, b) => {
-    const ea = Math.abs(a.effect ?? a.statistic ?? 0);
-    const eb = Math.abs(b.effect ?? b.statistic ?? 0);
-    return eb - ea || (a.q - b.q) || String(a.value ?? a.a).localeCompare(String(b.value ?? b.a));
+
+  // ── The feed: everything, tiered, deduped, ranked ──
+  const lowCeiling = Math.max(cfg.fdrQ, 0.35);
+  const feedPool = [
+    ...tested.filter((c) => c.q <= lowCeiling),
+    ...descriptive,
+  ];
+  const feed = dedupeBySubject(feedPool).map((c) => {
+    const t = assignTier(c, cfg);
+    return { ...c, ...t };
   });
 
-  for (const c of survivors) c.why = explain(c);
-  for (const c of descriptive) c.why = explain(c);
+  // Within a tier, rank by effect size rather than p-value. A tiny p on a
+  // trivial effect is a large sample, not an important fact.
+  const rank = { high: 0, medium: 1, low: 2 };
+  const strength = (c) =>
+    Math.abs(c.effect ?? 0) * 2 + Math.abs(c.share ?? 0) + Math.abs(c.statistic ?? 0) * 0.05;
+  feed.sort((a, b) =>
+    rank[a.tier] - rank[b.tier] ||
+    strength(b) - strength(a) ||
+    (a.q ?? 1) - (b.q ?? 1) ||
+    String(a.value ?? a.a).localeCompare(String(b.value ?? b.a)));
+
+  /* DIVERSITY.
+   *
+   * Ranking alone produced a feed where the first six cards all said the same
+   * thing: every combination involving rating = 1 showed slow deliveries,
+   * because in that dataset rating is a CONSEQUENCE of delivery time. The
+   * engine cannot know which way the arrow points -- that is exactly the
+   * causal claim it refuses to make -- but it can refuse to spend the whole
+   * feed restating one relationship.
+   *
+   * So selection is round-robin across measures with per-subject caps. The
+   * ranking still decides what wins inside each bucket; diversity decides how
+   * many turns each bucket gets. A reader gets the strongest finding about
+   * every measure before they get the second-strongest about any of them.
+   */
+  const capped = selectDiverse(feed, cfg);
+  for (const c of capped) c.why = explain(c);
+  for (const c of survivors) c.why = c.why || explain(c);
+  for (const c of descriptive) c.why = c.why || explain(c);
+
+  const counts = { high: 0, medium: 0, low: 0 };
+  for (const c of capped) counts[c.tier]++;
 
   return {
     version: INSIGHTS_VERSION,
     grain, period,
     insights: survivors,
+    feed: capped,
+    tierCounts: counts,
     descriptive: descriptive.slice(0, 6),
     audit: {
       testsRun: tested.length,
@@ -364,11 +433,131 @@ export function discoverInsights(cube, options = {}) {
       untestableReasons: untestable.slice(0, 8).map((u) => u.reason),
       supportFloor: { minCellRows: cfg.minCellRows, minShare: cfg.minShare },
       // The honest headline when nothing survives.
+      tierCounts: counts,
       verdict: survivors.length
-        ? `${survivors.length} of ${tested.length} tested cells survive correction at q <= ${cfg.fdrQ}.`
-        : `${tested.length} cells tested, none survive multiplicity correction at q <= ${cfg.fdrQ}. This data looks flat.`,
+        ? `${survivors.length} of ${tested.length} tested cells survive correction at q <= ${cfg.fdrQ}. ` +
+          `Showing ${capped.length}: ${counts.high} high, ${counts.medium} medium, ${counts.low} low.`
+        : `${tested.length} cells tested, none survive multiplicity correction at q <= ${cfg.fdrQ}. This data looks flat.` +
+          (counts.low ? ` ${counts.low} unproven pattern(s) are listed under low priority.` : ""),
     },
   };
+}
+
+/* ─── FEED SELECTION ─────────────────────────────────────────────────────── */
+
+function selectDiverse(feed, cfg) {
+  const byMeasure = new Map();
+  for (const c of feed) {
+    if (!byMeasure.has(c.measure)) byMeasure.set(c.measure, []);
+    byMeasure.get(c.measure).push(c);
+  }
+  const queues = Array.from(byMeasure.values());
+  const chosen = [];
+  const perPair = new Map();   // measure|dimA|dimB -> count
+  const perValue = new Map();  // measure|dim=value -> count
+  const cursor = new Array(queues.length).fill(0);
+
+  let progress = true;
+  while (chosen.length < cfg.maxFeed && progress) {
+    progress = false;
+    for (let qi = 0; qi < queues.length && chosen.length < cfg.maxFeed; qi++) {
+      const q = queues[qi];
+      while (cursor[qi] < q.length) {
+        const c = q[cursor[qi]++];
+        const pairKey = c.kind === "cross"
+          ? `${c.measure}|${[c.dimA, c.dimB].sort().join("×")}`
+          : `${c.measure}|${c.dim}`;
+        const valKeys = c.kind === "cross"
+          ? [`${c.measure}|${c.dimA}=${c.a}`, `${c.measure}|${c.dimB}=${c.b}`]
+          : [`${c.measure}|${c.dim}=${c.value}`];
+        if ((perPair.get(pairKey) || 0) >= cfg.maxPerPair) continue;
+        if (valKeys.some((k) => (perValue.get(k) || 0) >= cfg.maxPerValue)) continue;
+        perPair.set(pairKey, (perPair.get(pairKey) || 0) + 1);
+        for (const k of valKeys) perValue.set(k, (perValue.get(k) || 0) + 1);
+        chosen.push(c);
+        progress = true;
+        break;
+      }
+    }
+  }
+  const rank = { high: 0, medium: 1, low: 2 };
+  chosen.sort((a, b) => rank[a.tier] - rank[b.tier] ||
+    Math.abs(b.effect ?? 0) - Math.abs(a.effect ?? 0) || (a.q ?? 1) - (b.q ?? 1));
+  return chosen;
+}
+
+/* ─── PRIORITY TIERS ─────────────────────────────────────────────────────── */
+
+/**
+ * Rank every candidate into HIGH / MEDIUM / LOW.
+ *
+ * The first version of this engine reported only what cleared q <= 0.10 and
+ * showed nothing else. Statistically that is defensible; as a product it is
+ * not, because a user who connects a live dataset and sees three lines has no
+ * way to tell a well-behaved dataset from a broken tool.
+ *
+ * The resolution is that the TIER IS THE EVIDENCE STANDARD. Nothing is hidden
+ * and nothing is promoted beyond what its statistics support:
+ *
+ *   HIGH   — survives correction at q <= 0.01, has power, and the effect is
+ *            material. Act on these.
+ *   MEDIUM — survives at the standard q <= 0.10 bar, but the effect is
+ *            smaller or the test had limited power. Real, less urgent.
+ *   LOW    — did NOT clear the correction bar, or carries no applicable test
+ *            at all. Shown for completeness and labelled as unproven.
+ *
+ * A reader who only trusts HIGH gets exactly the old behaviour. A reader who
+ * wants the long tail can see it without being misled about what it is.
+ */
+export function assignTier(c, cfg) {
+  if (c.p == null) {
+    return { tier: "low", tierReason: "no significance test applies to this quantity — effect size only" };
+  }
+  const effect = Math.abs(c.effect ?? 0);
+  const material = effect >= 0.8 || Math.abs(c.share ?? 0) >= 0.25 ||
+    (c.kind === "persistence" && c.statistic >= 0.75) ||
+    (c.kind === "temporal" && Math.abs(c.pctChange ?? 0) >= 0.2);
+
+  if (c.q <= 0.001 && !c.lowPower && effect >= 1.0) {
+    return { tier: "high",
+      tierReason: `survives correction at q ≤ 0.001 with an effect of ${effect.toFixed(1)} SD` };
+  }
+  if (c.q <= 0.01 && !c.lowPower && material) {
+    return { tier: "medium", tierReason: `survives correction at q ≤ 0.01 with a material effect` };
+  }
+  if (c.q <= cfg.fdrQ) {
+    const why = c.lowPower ? "limited power" : !material ? "small effect" : "clears the standard bar";
+    return { tier: "medium", tierReason: `survives correction at q ≤ ${cfg.fdrQ} — ${why}` };
+  }
+  return { tier: "low",
+    tierReason: `does not clear multiplicity correction (q = ${c.q.toFixed(3)}) — unproven, shown for completeness` };
+}
+
+/**
+ * Collapse candidates that describe the SAME cell via different tests.
+ *
+ * dark_store = DS-07 being an outlier, being persistently the worst, and
+ * breaking from its own history are three views of one fact, not three
+ * findings. Presenting them as three inflates the feed and, worse, implies
+ * three independent pieces of evidence when the tests share the same data.
+ * Keep the strongest, record the others as corroboration.
+ */
+function dedupeBySubject(list) {
+  const bySubject = new Map();
+  for (const c of list) {
+    const key = c.kind === "cross"
+      ? `${c.measure}|${c.dimA}=${c.a}|${c.dimB}=${c.b}`
+      : `${c.measure}|${c.dim}=${c.value}`;
+    const prev = bySubject.get(key);
+    if (!prev) { bySubject.set(key, { ...c, corroboration: [] }); continue; }
+    const better = (c.q ?? 1) < (prev.q ?? 1);
+    if (better) {
+      bySubject.set(key, { ...c, corroboration: [...prev.corroboration, prev.test] });
+    } else {
+      prev.corroboration.push(c.test);
+    }
+  }
+  return Array.from(bySubject.values());
 }
 
 /* ─── DECOMPOSITION (the honest replacement for "causal") ────────────────── */
@@ -445,12 +634,13 @@ export function explain(c) {
       `the evidence is in the repetition, not the gap.`;
   }
   if (c.kind === "cross") {
-    const dir = c.lift > 1 ? "over" : "under";
-    const tail = c.descriptiveOnly
-      ? ` No significance test applies — ${c.measure} is not a count, so this is an effect size only.`
-      : ` Pearson residual ${c.statistic.toFixed(2)}.`;
-    return `${c.dimA} = ${c.a} combined with ${c.dimB} = ${c.b} is ${dir}-represented on ${c.measure} ` +
-      `at ${c.lift.toFixed(2)}x the level independence predicts.${tail}`;
+    const pctDiff = c.restMean ? (c.val - c.restMean) / Math.abs(c.restMean) : null;
+    return `${c.dimA} = ${c.a} combined with ${c.dimB} = ${c.b} averages ` +
+      `${c.val.toLocaleString(undefined, { maximumFractionDigits: 2 })} on ${c.measure}, ` +
+      `against ${c.restMean.toLocaleString(undefined, { maximumFractionDigits: 2 })} everywhere else` +
+      `${pctDiff != null ? ` — ${pctStr(pctDiff)} ${c.direction}` : ""}. ` +
+      `Welch t = ${c.statistic.toFixed(2)} on ${c.n.toLocaleString()} rows in the cell. ` +
+      `This compares averages, so it is not just a reflection of how many orders land here.`;
   }
   return "";
 }

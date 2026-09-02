@@ -263,12 +263,52 @@ export function profile(parsed, options = {}) {
     if (numericShare > 0.95 && nonNull > 0) {
       const nums = toNumericColumn(values);
       if (uniq <= cfg.minNumericUnique) {
+        // DUAL ROLE.
+        //
+        // A low-cardinality numeric column is usually BOTH. `rating` takes
+        // five values, so it slices well — average delivery time by rating.
+        // It is also a quantity you want to aggregate — average rating by
+        // dark store. Same for `items` and `tip`.
+        //
+        // The first version of this file classified these as dimensions only,
+        // and the effect on a real file was severe: a 13-column dataset
+        // profiled to 2 measures instead of 5, and the Correlate agent had
+        // nothing left to correlate against and returned "cannot be
+        // correlated here" on a file with five perfectly correlatable
+        // quantities. Being wrong here does not throw — it silently removes
+        // capability, which is worse.
         const interned = internColumn(values, cfg.cardinalityCutoff + 1);
-        dims.push({ col, cardinality: uniq, coded: true,
+        dims.push({ col, cardinality: uniq, coded: true, dualRole: true,
           values: Array.from(distinct).map(Number).sort((a, b) => a - b).map(String) });
-        schema[col] = { ...base, type: "dimension", reason: `only ${uniq} distinct numbers — treated as codes` };
         columnData[col] = values;
         if (interned) columnData[col + "\u0000codes"] = interned;
+
+        const cleanCoded = [];
+        for (let i = 0; i < nums.length; i++) if (!Number.isNaN(nums[i])) cleanCoded.push(nums[i]);
+        const momC = moments(cleanCoded, 1);
+        const { min: mnC, max: mxC } = extent(cleanCoded);
+        // A two-valued numeric is a flag, not a quantity. Three or more with
+        // real spread is something you can meaningfully aggregate.
+        const worthAggregating = uniq >= 3 && momC.sd > 0 && !nameLooksLikeId(col);
+        if (worthAggregating) {
+          const { agg, reason } = classifyAggregation(col, nums);
+          const dispersionIndex = mnC >= 0 && momC.mean > 0
+            ? (momC.variance + momC.mean * momC.mean) / momC.mean : null;
+          measures.push({
+            col, agg, aggReason: `${reason}; also usable as a dimension (${uniq} distinct values)`,
+            dispersionIndex, dualRole: true,
+            mean: momC.mean, sd: momC.sd, min: mnC, max: mxC,
+            p05: quantile(cleanCoded, 0.05), p50: quantile(cleanCoded, 0.5),
+            p95: quantile(cleanCoded, 0.95),
+            countLike: isCountLike(nums), nonNull,
+          });
+          columnData[col + "\u0000num"] = nums;
+          schema[col] = { ...base, type: "dimension+measure", agg,
+            reason: `${uniq} distinct numbers — usable both as a slice and as a quantity` };
+        } else {
+          schema[col] = { ...base, type: "dimension",
+            reason: `only ${uniq} distinct numbers — treated as codes` };
+        }
         continue;
       }
       const clean = [];

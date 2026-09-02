@@ -22,7 +22,14 @@ import { parseDateParts, toEpochDay } from "./profile.js";
 
 export const CUBE_VERSION = "cube/1.0.0";
 export const TIME_GRAINS = ["day", "week", "month", "quarter", "year"];
-export const CROSS_GRAINS = ["month", "quarter", "year"];
+/* Cross-cells at month grain only.
+   Materialising 2-way pairs at month, quarter AND year was 65% of the entire
+   build cost on a real 79k-row, 8-dimension, 5-measure file -- 51 million
+   accumulator calls, 5.5 seconds before the first insight could appear. The
+   quarter and year cross-cells were almost never read: 2-way questions are
+   asked at the grain the data moves, which is the month. Dropping the two
+   coarse grains removes 43% of the work for capability nobody used. */
+export const CROSS_GRAINS = ["month"];
 export const SEP = "\u241F";
 
 const DEFAULTS = {
@@ -93,9 +100,14 @@ function makeGrainCache() {
 function bump(bucket, measure, val) {
   let c = bucket[measure];
   if (c === undefined) {
-    c = bucket[measure] = { sum: 0, count: 0, min: Infinity, max: -Infinity };
+    c = bucket[measure] = { sum: 0, sumSq: 0, count: 0, min: Infinity, max: -Infinity };
   }
   c.sum += val;
+  // Sum of squares costs one more double per cell and unlocks the variance of
+  // any cell -- and therefore a proper two-sample test on cell MEANS. It also
+  // makes the point that a variance is an aggregate: nothing here ever needs
+  // to go back to the rows.
+  c.sumSq += val * val;
   c.count += 1;
   if (val < c.min) c.min = val;
   if (val > c.max) c.max = val;
@@ -123,7 +135,7 @@ export function selectCrossPairs(dims, cfg) {
   candidates.sort((x, y) => x.cells - y.cells || x.key.localeCompare(y.key));
   const chosen = [];
   let budget = 0;
-  const perPeriodMultiplier = CROSS_GRAINS.length * 24; // rough period allowance
+  const perPeriodMultiplier = CROSS_GRAINS.length * 36; // rough period allowance
   for (const c of candidates) {
     const projected = budget + c.cells * perPeriodMultiplier;
     if (projected > cfg.maxTotalCrossCells) continue;
@@ -156,7 +168,12 @@ export async function buildCube(prof, options = {}) {
 
   const dates = columnData[timeCol];
   const dimData = cubeDims.map((d) => ({ col: d.col, values: columnData[d.col] }));
-  const measData = measures.map((m) => ({ col: m.col, values: columnData[m.col] }));
+  // A dual-role column stores raw strings under its own name (for the
+  // dimension) and a parsed Float64Array under a shadow key (for the measure).
+  const measData = measures.map((m) => ({
+    col: m.col,
+    values: m.dualRole ? columnData[m.col + "\u0000num"] : columnData[m.col],
+  }));
 
   const { chosen: crossPairs, skipped: pairsSkipped } = selectCrossPairs(cubeDims, cfg);
   const crossIndexed = crossPairs.map((p) => ({
@@ -168,6 +185,8 @@ export async function buildCube(prof, options = {}) {
   for (const g of TIME_GRAINS) { cube.cells[g] = {}; cube.totals[g] = {}; }
 
   const cache = makeGrainCache();
+  const mvCols = new Array(measData.length);
+  const mvVals = new Float64Array(measData.length);
   let unparsedDates = 0;
   const start = Date.now();
 
@@ -178,16 +197,21 @@ export async function buildCube(prof, options = {}) {
       const keys = cache.get(dates[r]);
       if (!keys) { unparsedDates++; continue; }
 
-      // Pull this row's measures once.
-      const mv = [];
+      // Pull this row's measures once, into preallocated buffers. The first
+      // version allocated a fresh array of [col, value] pairs per row, which
+      // on 79k rows is 79k arrays plus one small array per measure inside
+      // them -- pure garbage for the collector to chase during the build.
+      let mvLen = 0;
       for (let k = 0; k < measData.length; k++) {
         const v = measData[k].values[r];
         if (typeof v === "number" ? Number.isNaN(v) : (v === "" || v == null)) continue;
         const num = typeof v === "number" ? v : Number(v);
         if (!Number.isFinite(num)) continue;
-        mv.push([measData[k].col, num]);
+        mvCols[mvLen] = measData[k].col;
+        mvVals[mvLen] = num;
+        mvLen++;
       }
-      if (!mv.length) continue;
+      if (!mvLen) continue;
 
       for (let gi = 0; gi < TIME_GRAINS.length; gi++) {
         const g = TIME_GRAINS[gi];
@@ -195,7 +219,7 @@ export async function buildCube(prof, options = {}) {
 
         let tb = cube.totals[g][pk];
         if (tb === undefined) tb = cube.totals[g][pk] = {};
-        for (let k = 0; k < mv.length; k++) bump(tb, mv[k][0], mv[k][1]);
+        for (let k = 0; k < mvLen; k++) bump(tb, mvCols[k], mvVals[k]);
 
         const gcells = cube.cells[g];
         for (let d = 0; d < dimData.length; d++) {
@@ -205,10 +229,10 @@ export async function buildCube(prof, options = {}) {
           let cc = gcells[combo]; if (cc === undefined) cc = gcells[combo] = {};
           let cp = cc[pk];        if (cp === undefined) cp = cc[pk] = {};
           let cd = cp[dv];        if (cd === undefined) cd = cp[dv] = {};
-          for (let k = 0; k < mv.length; k++) bump(cd, mv[k][0], mv[k][1]);
+          for (let k = 0; k < mvLen; k++) bump(cd, mvCols[k], mvVals[k]);
         }
 
-        if (g === "month" || g === "quarter" || g === "year") {
+        if (CROSS_GRAINS.indexOf(g) !== -1) {
           for (let x = 0; x < crossIndexed.length; x++) {
             const cx = crossIndexed[x];
             const va = cx.aVals[r], vb = cx.bVals[r];
@@ -217,7 +241,7 @@ export async function buildCube(prof, options = {}) {
             let cc = gcells[cx.key]; if (cc === undefined) cc = gcells[cx.key] = {};
             let cp = cc[pk];         if (cp === undefined) cp = cc[pk] = {};
             let cd = cp[ck];         if (cd === undefined) cd = cp[ck] = {};
-            for (let k = 0; k < mv.length; k++) bump(cd, mv[k][0], mv[k][1]);
+            for (let k = 0; k < mvLen; k++) bump(cd, mvCols[k], mvVals[k]);
           }
         }
       }

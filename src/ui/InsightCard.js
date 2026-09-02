@@ -1,6 +1,8 @@
 import { useState, useMemo } from "react";
-import { T, CLASS_COLOR, evidenceTier, fmtKpi, fmtSci } from "./tokens.js";
+import { T, CLASS_COLOR, PRIORITY, evidenceTier, fmtKpi, fmtSci } from "./tokens.js";
 import { SafeChart, renderChart, Delta } from "./Charts.js";
+import { ProvenanceFooter } from "./ProvenanceFooter.js";
+import { ContextHits } from "./ContextPanel.js";
 
 /* ═══════════════════════════════════════════════════════════════════════════
    EVIDENCE STRIP — the signature element.
@@ -32,12 +34,12 @@ export function EvidenceStrip({ evidence, audit, compact }) {
     <div style={{
       display: "flex", alignItems: "center", gap: 8,
       borderLeft: `2px solid ${tier.color}`, paddingLeft: 9,
-      marginTop: compact ? 6 : 10,
+      marginTop: compact ? 6 : 10, flexWrap: "wrap", minWidth: 0,
     }}>
       <span style={{ fontFamily: T.mono, fontSize: 8, fontWeight: 600, letterSpacing: "0.8px",
         color: tier.color, whiteSpace: "nowrap" }}>{tier.label}</span>
-      <span style={{ fontFamily: T.mono, fontSize: 10, color: T.textMid,
-        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <span className="ax-wrap" style={{ fontFamily: T.mono, fontSize: 10, color: T.textMid,
+        minWidth: 0, flex: 1 }}>
         {parts.join(" · ")}
       </span>
     </div>
@@ -49,11 +51,14 @@ export function EvidenceStrip({ evidence, audit, compact }) {
 function Row({ k, v, mono = true, color }) {
   if (v == null || v === "") return null;
   return (
-    <div style={{ display: "flex", gap: 10, padding: "4px 0", borderBottom: `1px solid ${T.border}` }}>
-      <span style={{ fontSize: 10, color: T.textDim, minWidth: 118, flexShrink: 0,
-        letterSpacing: "0.4px", textTransform: "uppercase" }}>{k}</span>
-      <span style={{ fontSize: 11, color: color || T.textMid, fontFamily: mono ? T.mono : T.sans,
-        wordBreak: "break-all", lineHeight: 1.5 }}>{v}</span>
+    <div style={{ display: "flex", gap: 8, padding: "4px 0", borderBottom: `1px solid ${T.border}`,
+      minWidth: 0, alignItems: "baseline" }}>
+      <span style={{ fontSize: 9.5, color: T.textDim, width: 92, flexShrink: 0,
+        letterSpacing: "0.4px", textTransform: "uppercase", lineHeight: 1.4 }}>{k}</span>
+      {/* flex children default to min-width:auto; without the override a
+          64-character hash makes this row wider than the phone. */}
+      <span className="ax-wrap" style={{ flex: 1, minWidth: 0, fontSize: 10.5,
+        color: color || T.textMid, fontFamily: mono ? T.mono : T.sans, lineHeight: 1.5 }}>{v}</span>
     </div>
   );
 }
@@ -62,8 +67,9 @@ export function ProofDrawer({ card, record, onVerify, verification }) {
   const e = card.evidence;
   const a = card.audit;
   return (
-    <div style={{ background: T.bg1, border: `1px solid ${T.borderHi}`, borderRadius: 8,
-      padding: 14, marginTop: 12, animation: "slidein .18s ease-out" }}>
+    <div className="ax-card" style={{ background: T.bg1, border: `1px solid ${T.borderHi}`,
+      borderRadius: 8, padding: 12, marginTop: 12, minWidth: 0, maxWidth: "100%",
+      overflow: "hidden", animation: "slidein .18s ease-out" }}>
       <div style={{ fontSize: 9, letterSpacing: "2px", textTransform: "uppercase",
         color: T.textDim, fontWeight: 600, marginBottom: 10 }}>How this number was produced</div>
 
@@ -111,10 +117,34 @@ export function ProofDrawer({ card, record, onVerify, verification }) {
         </>
       )}
 
+      {card.narration && (
+        <>
+          <div style={{ height: 10 }} />
+          <Row k="Narration" v={card.narration.source} />
+          {card.narration.reason && (
+            <Row k="Narration note" v={card.narration.reason} mono={false} color={T.amber} />
+          )}
+          <Row k="Numbers checked" v={`${card.narration.guard?.checked ?? 0} — all verified against engine output`} mono={false} />
+        </>
+      )}
+
+      {card.contextHits?.length > 0 && (
+        <>
+          <div style={{ height: 10 }} />
+          {card.contextHits.map((h) => (
+            <Row key={h.id} k={`Context ${h.id}`} mono={false}
+              v={`${h.source}${h.dates.length ? ` (${h.dates.join(", ")})` : ""} — matched: ${h.reasons.join("; ")}`} />
+          ))}
+          <Row k="Context caveat" mono={false} color={T.amber}
+            v="Retrieved by date alignment and name match. The engine ran no test on this and it is not part of any p-value above." />
+        </>
+      )}
+
       {record && (
         <>
           <div style={{ height: 10 }} />
           <Row k="Dataset" v={`${record.dataset.fileName} · ${record.dataset.rows.toLocaleString()} rows`} />
+          <Row k="Skill" v={record.skillHash ? `${record.skillHash.slice(0, 24)}…` : null} />
           <Row k="Content hash" v={`${record.dataset.contentHashAlgo}: ${record.dataset.contentHash}`} />
           <Row k="Engine" v={Object.values(record.engine).join(" · ")} />
           <Row k="Record" v={record.recordHash} />
@@ -148,23 +178,44 @@ export function ProofDrawer({ card, record, onVerify, verification }) {
   );
 }
 
+/* ─── PRIORITY BADGE ─────────────────────────────────────────────────────── */
+
+export function PriorityBadge({ tier, reason }) {
+  if (!tier) return null;
+  const p = PRIORITY[tier];
+  return (
+    <span title={reason || p.note}
+      style={{ fontFamily: T.mono, fontSize: 8, fontWeight: 700, letterSpacing: "1px",
+        padding: "2px 6px", borderRadius: 3, color: p.color,
+        background: `${p.color}18`, border: `1px solid ${p.color}45`, whiteSpace: "nowrap" }}>
+      {p.label}
+    </span>
+  );
+}
+
 /* ─── CARD ───────────────────────────────────────────────────────────────── */
 
-export function InsightCard({ card, pinned, onPin, onSpeak, record, onVerify, verification }) {
+export function InsightCard({ card, pinned, onPin, onSpeak, record, onVerify, verification,
+                              skill, freshness }) {
   const [showProof, setShowProof] = useState(false);
   const isPinned = pinned.some((p) => p.id === card.id);
   const chart = useMemo(() => renderChart(card), [card]);
   const tier = evidenceTier(card.evidence);
 
   return (
-    <div style={{ background: T.bg2, border: `1px solid ${isPinned ? `${T.amber}55` : T.border}`,
-      borderRadius: 10, padding: 17, display: "flex", flexDirection: "column", gap: 11 }}>
+    <div className="ax-card" style={{ background: T.bg2,
+      border: `1px solid ${isPinned ? `${T.amber}55` : T.border}`,
+      borderLeft: card.tier ? `3px solid ${PRIORITY[card.tier].color}` : undefined,
+      borderRadius: 10, padding: 15, display: "flex", flexDirection: "column", gap: 11,
+      minWidth: 0, maxWidth: "100%", overflow: "hidden" }}>
 
       <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: T.text, lineHeight: 1.4 }}>{card.title}</div>
+          <div className="ax-wrap" style={{ fontSize: 13, fontWeight: 600, color: T.text,
+            lineHeight: 1.4 }}>{card.title}</div>
           <div style={{ fontSize: 9, color: T.textDim, marginTop: 5, letterSpacing: "0.5px",
             display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <PriorityBadge tier={card.tier} reason={card.tierReason} />
             {card.insightClass && (
               <span style={{ fontSize: 8, letterSpacing: "1px", textTransform: "uppercase", fontWeight: 700,
                 padding: "2px 6px", borderRadius: 3,
@@ -213,14 +264,30 @@ export function InsightCard({ card, pinned, onPin, onSpeak, record, onVerify, ve
 
       {chart && <SafeChart height={130}>{chart}</SafeChart>}
 
-      {card.summary && (
-        <div style={{ fontSize: 11.5, color: T.textMid, lineHeight: 1.65, paddingTop: 9,
-          borderTop: `1px solid ${T.border}` }}>
-          {card.summary}
+      {(card.narration?.text || card.summary) && (
+        <div className="ax-wrap" style={{ fontSize: 11.5, color: T.textMid, lineHeight: 1.65,
+          paddingTop: 9, borderTop: `1px solid ${T.border}` }}>
+          {card.narration?.text || card.summary}
+        </div>
+      )}
+
+      {card.tierReason && (
+        <div className="ax-wrap" style={{ fontSize: 10, color: PRIORITY[card.tier]?.color,
+          fontFamily: T.mono, lineHeight: 1.5 }}>
+          {PRIORITY[card.tier].label} — {card.tierReason}
+        </div>
+      )}
+
+      {card.corroboration?.length > 0 && (
+        <div className="ax-wrap" style={{ fontSize: 10, color: T.textDim, lineHeight: 1.5 }}>
+          Also flagged by {card.corroboration.join(" and ").replace(/-/g, " ")} on the same cell.
+          These are views of one fact, not independent evidence — they share the data.
         </div>
       )}
 
       <EvidenceStrip evidence={card.evidence} audit={card.audit} />
+
+      <ContextHits hits={card.contextHits} period={card.period} />
 
       <button onClick={() => setShowProof((s) => !s)}
         style={{ alignSelf: "flex-start", fontSize: 10, padding: "5px 10px", borderRadius: 4,
@@ -232,6 +299,9 @@ export function InsightCard({ card, pinned, onPin, onSpeak, record, onVerify, ve
       {showProof && (
         <ProofDrawer card={card} record={record} onVerify={onVerify} verification={verification} />
       )}
+
+      <ProvenanceFooter card={card} record={record} skill={skill}
+        narration={card.narration} freshness={freshness} />
     </div>
   );
 }

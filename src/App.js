@@ -1,14 +1,18 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
-import { T, GLOBAL_CSS, fmtKpi } from "./ui/tokens.js";
+import { T, GLOBAL_CSS, fmtKpi, PRIORITY } from "./ui/tokens.js";
 import { UploadScreen } from "./ui/UploadScreen.js";
 import { InsightCard, AgentTrace } from "./ui/InsightCard.js";
 import { SchemaPanel, AuditPanel, PinnedPanel } from "./ui/Panels.js";
+import { SkillPanel, ContextPanel } from "./ui/ContextPanel.js";
+import { generateSkill } from "./skill.js";
+import { indexContext, retrieveContext } from "./context.js";
+import { narrate } from "./narrate.js";
 import {
   buildCube, withTimeColumn, withAggregation,
   queryBreakdown, queryTrend, queryTotal, queryTopK,
   resolveGrain, latestPeriod,
 } from "./engine/index.js";
-import { runAgent } from "./agents.js";
+import { runAgent, buildFeed } from "./agents.js";
 import { parseIntent, suggestions } from "./nlu.js";
 import {
   createJournal, appendToJournal, verifyJournal, verifyRecord,
@@ -87,7 +91,13 @@ export default function App() {
   const [records, setRecords] = useState({});  // cardId -> record
   const [verify, setVerify] = useState({});    // cardId -> verification
   const [chainVerify, setChainVerify] = useState(null);
+  const [feedAudit, setFeedAudit] = useState(null);
+  const [tierFilter, setTierFilter] = useState("all");
   const dataRef = useRef(null);
+  const [skill, setSkill] = useState(null);
+  const [context, setContext] = useState(null);
+  const contextRef = useRef(null);
+  const skillRef = useRef(null);
   const [panel, setPanel] = useState("schema");
   const [mobilePanel, setMobilePanel] = useState(null);
   const [speakOn, setSpeakOn] = useState(false);
@@ -98,9 +108,13 @@ export default function App() {
   const voice = useVoice({ onTranscript: (t) => { setQuery(t); askRef.current?.(t); } });
 
   /* ── Load ────────────────────────────────────────────────────────────── */
-  const handleReady = useCallback((loaded) => {
+  const handleReady = useCallback(async (loaded) => {
     setData(loaded);
     dataRef.current = loaded;
+    // The skill is generated here, once, from profiling output that already
+    // exists. It costs nothing and it is regenerated on any schema override.
+    const sk = await generateSkill(loaded);
+    skillRef.current = sk; setSkill(sk);
     setCards([]); setPinned([]); setRecords({}); setVerify({});
     journalRef.current = createJournal();   // a new file starts a new chain
     setJournalVersion((v) => v + 1);
@@ -109,6 +123,29 @@ export default function App() {
     // saying "nothing survived correction" is the useful answer when true.
     runScan(loaded);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* Attach context and narration to a finished card.
+     Order matters and is deliberate: the engine has already produced every
+     number by the time this runs. Retrieval and narration are strictly
+     downstream and can only add prose, never alter a value. */
+  const enrich = useCallback(async (card) => {
+    const sk = skillRef.current;
+    const ctx = contextRef.current;
+    let hits = [];
+    if (ctx) {
+      const ev = card.evidence || {};
+      const subjects = [card.measure, card.dimension, ev.value, ev.a, ev.b,
+        card.decomposition?.additive?.rows?.[0]?.key,
+        card.crossLocalization?.lead?.key].filter(Boolean);
+      hits = retrieveContext(ctx, {
+        period: card.period, grain: card.grain, subjects, queryText: card.title || "",
+      });
+    }
+    card.contextHits = hits;
+    // llm is null by default — see narrate.js. The numeric guard runs either way.
+    card.narration = await narrate({ card, skill: sk, contextHits: hits, llm: null });
+    return card;
   }, []);
 
   const writeRecord = useCallback(async (card, loaded) => {
@@ -123,7 +160,14 @@ export default function App() {
         agent: card.agent || null,
         finding: card.evidence || null,
         audit: card.audit || null,
-        result: { summary: card.summary, kpi: card.kpi ?? null },
+        result: { summary: card.narration?.text || card.summary, kpi: card.kpi ?? null },
+        skillHash: skillRef.current?.skillHash || null,
+        context: contextRef.current ? {
+          source: contextRef.current.fileName,
+          docHash: contextRef.current.docHash,
+          entriesConsulted: (card.contextHits || []).map((h) => h.id),
+        } : null,
+        narration: card.narration || null,
       });
       setJournalVersion((v) => v + 1);
       setRecords((r) => ({ ...r, [card.id]: rec }));
@@ -136,19 +180,40 @@ export default function App() {
     }
   }, []);
 
+  /* On connect, build the whole ranked feed rather than a single card.
+     The engine was already locating dozens of corrected findings; the old
+     version dropped all but the top three into a summary paragraph. */
   const runScan = useCallback(async (loaded) => {
     const src = loaded || dataRef.current;
     if (!src) return;
-    const intent = { title: "Scan for anything unusual", agent: "scan", grain: null,
-      measure: src.cube.meta.measures[0]?.col };
-    setBusy(true); setTraceLive(true); setTrace([]);
-    const card = await runAgent(src.cube, intent, setTrace);
-    card.id = nextCardId(intent.title);
-    card.title = intent.title;
+    setBusy(true); setTraceLive(true);
+    setTrace([{ phase: "TRAVERSE", label: "Walk the cube",
+      detail: `Testing every measure × dimension × cross-cell across ${src.cube.meta.dims.length} dimension(s) and ${src.cube.meta.measures.length} measure(s).` }]);
+
+    // Yield once so the trace paints before the traversal blocks the thread.
+    await new Promise((r) => setTimeout(r, 30));
+    const { cards: feedCards, audit, tierCounts } = buildFeed(src.cube);
+
+    setTrace((t) => [...(t || []), {
+      phase: "CORRECT", label: "Control the false discovery rate",
+      detail: `${audit.testsRun} tests run, ${audit.survived} survive Benjamini-Hochberg at q ≤ ${audit.fdrQ}. ` +
+        `Without correction roughly ${Math.round(audit.testsRun * 0.05)} cells would look significant by chance alone.`,
+    }, {
+      phase: "RANK", label: "Sort into priority tiers",
+      detail: `${tierCounts.high} high, ${tierCounts.medium} medium, ${tierCounts.low} low. ` +
+        `The tier is the evidence standard — nothing is promoted beyond what its statistics support.`,
+    }]);
+    await new Promise((r) => setTimeout(r, 400));
+
     setTraceLive(false); setTrace(null); setBusy(false);
-    setCards([card]);
-    await writeRecord(card, src);
-  }, [writeRecord]);
+    setFeedAudit({ audit, tierCounts });
+    setCards(feedCards);
+    // Enrich and record progressively so the feed is readable immediately
+    // rather than after forty hash computations.
+    for (const c of feedCards) { await enrich(c); }
+    setCards((p) => [...p]);
+    for (const c of feedCards.slice(0, 12)) await writeRecord(c, src);
+  }, [writeRecord, enrich]);
 
   /* ── Ask ─────────────────────────────────────────────────────────────── */
   const handleAsk = useCallback(async (text) => {
@@ -173,11 +238,13 @@ export default function App() {
       grain: intent.grain, unresolved: intent.unresolved };
     card.aggNote = data.profile.measures.find((m) => m.col === card.measure)?.aggReason;
 
+    await enrich(card);
     setCards((prev) => [card, ...prev]);
     setBusy(false);
     await writeRecord(card);
-    if (speakOn && card.summary) voice.speak(card.summary);
-  }, [query, data, writeRecord, speakOn, voice]);
+    const spoken = card.narration?.text || card.summary;
+    if (speakOn && spoken) voice.speak(spoken);
+  }, [query, data, writeRecord, speakOn, voice, enrich]);
   askRef.current = handleAsk;
 
   /* ── Schema overrides — rebuild the cube ─────────────────────────────── */
@@ -188,6 +255,11 @@ export default function App() {
       const next = { ...data, profile: nextProfile, cube };
       setData(next);
       dataRef.current = next;
+      // A schema override changes what the data means, so the skill is
+      // regenerated rather than patched. Its hash changes with it, which is
+      // what makes a stale interpretation visible in the audit trail.
+      const sk = await generateSkill(next);
+      skillRef.current = sk; setSkill(sk);
       setCards([]);
       await runScan(next);
     } finally { setBusy(false); }
@@ -204,6 +276,38 @@ export default function App() {
   }, [data, rebuild]);
 
   /* ── Verification ────────────────────────────────────────────────────── */
+  const onAttachContext = useCallback(async (fileOrText, name) => {
+    if (!dataRef.current) return;
+    setBusy(true);
+    try {
+      const text = typeof fileOrText === "string" ? fileOrText : await fileOrText.text();
+      const fileName = typeof fileOrText === "string" ? (name || "pasted notes") : fileOrText.name;
+      const d = dataRef.current;
+      // Subjects are every name a context entry could plausibly refer to.
+      const subjects = [
+        ...d.cube.meta.dims.map((x) => x.col),
+        ...d.cube.meta.dims.flatMap((x) => x.values || []),
+        ...d.cube.meta.measures.map((x) => x.col),
+      ];
+      const idx = await indexContext(text, { fileName, subjects });
+      contextRef.current = idx; setContext(idx);
+      // Re-enrich the cards already on screen so attaching context is
+      // retroactive. Numbers are untouched; only prose and footers change.
+      setCards((prev) => {
+        Promise.all(prev.map((c) => enrich(c))).then(() => setCards((p) => [...p]));
+        return prev;
+      });
+    } finally { setBusy(false); }
+  }, [enrich]);
+
+  const onClearContext = useCallback(() => {
+    contextRef.current = null; setContext(null);
+    setCards((prev) => {
+      Promise.all(prev.map((c) => enrich(c))).then(() => setCards((p) => [...p]));
+      return prev;
+    });
+  }, [enrich]);
+
   const onVerifyRecord = useCallback(async (rec) => {
     const v = await verifyRecord(rec);
     const cardId = Object.keys(records).find((k) => records[k].recordHash === rec.recordHash);
@@ -215,6 +319,9 @@ export default function App() {
   }, []);
 
   const chips = useMemo(() => (data ? suggestions(data.profile) : []), [data]);
+  // Freshness is the newest date IN THE DATA, not the time the analysis ran.
+  // Those differ, and the one that matters for trusting a number is the former.
+  const freshness = skill?.grain?.latest || null;
 
   if (!data) return <UploadScreen onReady={handleReady} />;
 
@@ -224,6 +331,10 @@ export default function App() {
       <SchemaPanel profile={prof} warnings={data.warnings}
         onSetTimeColumn={onSetTimeColumn} onSetAggregation={onSetAggregation}
         onAsk={(q) => { setMobilePanel(null); handleAsk(q); }} />
+    ) : panel === "skill" ? (
+      <SkillPanel skill={skill} />
+    ) : panel === "context" ? (
+      <ContextPanel context={context} onAttach={onAttachContext} onClear={onClearContext} busy={busy} />
     ) : panel === "audit" ? (
       <AuditPanel key={journalVersion} journal={journal} verification={chainVerify}
         onVerifyAll={onVerifyAll} fingerprint={data.fingerprint} />
@@ -233,15 +344,16 @@ export default function App() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh",
-      background: T.bg0, color: T.text, fontFamily: T.sans }}>
+      background: T.bg0, color: T.text, fontFamily: T.sans, maxWidth: "100%", overflowX: "hidden" }}>
       <style>{GLOBAL_CSS}</style>
 
       {/* HEADER */}
       <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
-        padding: isMobile ? "10px 14px" : "12px 22px", borderBottom: `1px solid ${T.border}`,
+        maxWidth: "100%", padding: isMobile ? "10px 12px" : "12px 22px", borderBottom: `1px solid ${T.border}`,
         background: T.bg1, position: "sticky", top: 0, zIndex: 100 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-          <span style={{ fontSize: isMobile ? 15 : 17, fontWeight: 800, letterSpacing: "-1px" }}>
+          <span style={{ fontSize: isMobile ? 14 : 17, fontWeight: 800, letterSpacing: "-1px",
+            whiteSpace: "nowrap" }}>
             axilattice <span style={{ color: T.amber }}>·</span> v8
           </span>
           {!isMobile && (
@@ -319,9 +431,9 @@ export default function App() {
 
       {/* BODY */}
       <div style={{ display: "flex", flex: 1, minHeight: 0, position: "relative",
-        alignItems: "flex-start" }}>
-        <main style={{ flex: 1, minWidth: 0, padding: isMobile ? "16px 14px 76px" : "18px 22px",
-          width: "100%" }}>
+        alignItems: "flex-start", maxWidth: "100%", overflowX: "hidden" }}>
+        <main style={{ flex: 1, minWidth: 0, maxWidth: "100%", overflowX: "hidden",
+          padding: isMobile ? "16px 12px 78px" : "18px 22px", width: "100%" }}>
           {trace && <AgentTrace trace={trace} live={traceLive} />}
 
           {busy && !trace && (
@@ -344,11 +456,37 @@ export default function App() {
             </div>
           )}
 
+          {feedAudit && cards.some((c) => c.fromFeed) && (
+            <div style={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 10,
+              padding: 13, marginBottom: 16, minWidth: 0 }}>
+              <div className="ax-wrap" style={{ fontSize: 11.5, color: T.textMid, lineHeight: 1.6 }}>
+                {feedAudit.audit.verdict}
+              </div>
+              <div style={{ display: "flex", gap: 6, marginTop: 11, flexWrap: "wrap" }}>
+                {[["all", `All ${cards.length}`],
+                  ["high", `High ${feedAudit.tierCounts.high}`],
+                  ["medium", `Medium ${feedAudit.tierCounts.medium}`],
+                  ["low", `Low ${feedAudit.tierCounts.low}`]].map(([id, label]) => {
+                  const on = tierFilter === id;
+                  const col = id === "all" ? T.amber : PRIORITY[id].color;
+                  return (
+                    <button key={id} onClick={() => setTierFilter(id)}
+                      style={{ fontSize: 11, padding: "5px 12px", borderRadius: 20, cursor: "pointer",
+                        fontFamily: T.sans, border: `1px solid ${on ? col : T.border}`,
+                        background: on ? `${col}1a` : "transparent", color: on ? col : T.textMid }}>
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div style={{ display: "grid",
-            gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(340px, 1fr))",
-            gap: 16 }}>
-            {cards.map((c) => (
-              <InsightCard key={c.id} card={c} pinned={pinned}
+            gridTemplateColumns: isMobile ? "minmax(0, 1fr)" : "repeat(auto-fill, minmax(320px, 1fr))",
+            gap: 14 }}>
+            {cards.filter((c) => tierFilter === "all" || !c.fromFeed || c.tier === tierFilter).map((c) => (
+              <InsightCard key={c.id} card={c} pinned={pinned} skill={skill} freshness={freshness}
                 record={records[c.id]} verification={verify[c.id]} onVerify={onVerifyRecord}
                 onPin={(card) => setPinned((p) => p.some((x) => x.id === card.id)
                   ? p.filter((x) => x.id !== card.id) : [...p, card])}
@@ -375,10 +513,12 @@ export default function App() {
                   border: "none", color: T.textMid, fontSize: 18, cursor: "pointer" }}>✕</button>
             )}
             <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
-              {[["schema", "Schema"], ["audit", "Audit"], ["pins", `Pins ${pinned.length}`]].map(([id, label]) => (
+              {[["schema", "Schema"], ["skill", `Skill${skill?.gotchas.length ? ` ${skill.gotchas.length}` : ""}`],
+                ["context", context ? "Context ✓" : "Context"], ["audit", "Audit"],
+                ["pins", `Pins ${pinned.length}`]].map(([id, label]) => (
                 <button key={id} onClick={() => setPanel(id)}
-                  style={{ flex: 1, padding: "6px 4px", borderRadius: 5, cursor: "pointer",
-                    fontSize: 10.5, fontFamily: T.sans,
+                  style={{ flex: 1, padding: "6px 2px", borderRadius: 5, cursor: "pointer",
+                    fontSize: 9.5, fontFamily: T.sans, whiteSpace: "nowrap",
                     border: `1px solid ${panel === id ? `${T.amber}50` : T.border}`,
                     background: panel === id ? T.amberGlow : "transparent",
                     color: panel === id ? T.amber : T.textMid }}>
@@ -403,6 +543,8 @@ export default function App() {
           {[
             { id: null, label: "Insights", icon: "◆" },
             { id: "schema", label: "Schema", icon: "◈", panel: "schema" },
+            { id: "skill", label: "Skill", icon: "▤", panel: "skill" },
+            { id: "context", label: "Context", icon: "❐", panel: "context" },
             { id: "audit", label: "Audit", icon: "⛓", panel: "audit" },
             { id: "pins", label: `Pins ${pinned.length}`, icon: "◉", panel: "pins" },
           ].map((tab) => (

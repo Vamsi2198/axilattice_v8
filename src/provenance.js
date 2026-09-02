@@ -29,7 +29,6 @@
         proves that this analysis ran against a file with this exact content.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* global globalThis */
 import { STATS_VERSION } from "./engine/stats.js";
 import { CSV_VERSION } from "./engine/csv.js";
 import { PROFILE_VERSION } from "./engine/profile.js";
@@ -165,7 +164,8 @@ export async function fingerprintDataset(text, parsed, prof, fileName) {
  */
 export async function buildRecord({
   dataset, question, intent, grain, period,
-  agent, finding, audit, result, chainPrev = null, clock,
+  agent, finding, audit, result, skillHash = null, context = null,
+  narration = null, chainPrev = null, clock,
 }) {
   // Clock is injected so tests are deterministic. In the app it is Date.now.
   const at = clock ? clock() : Date.now();
@@ -211,6 +211,24 @@ export async function buildRecord({
       supportFloor: audit.supportFloor,
     } : null,
     result: result || null,
+    // The skill is generated from the schema, so its hash pins WHICH schema
+    // interpretation produced this answer. Change the time axis and the skill
+    // hash changes, which is exactly the signal a reviewer needs.
+    skillHash,
+    // Context is recorded by source and entry id, never by contributing to a
+    // number. A reviewer can see what was consulted and go read it.
+    context: context ? {
+      source: context.source, docHash: context.docHash,
+      entriesConsulted: context.entriesConsulted,
+      retrievedBy: "date alignment and subject name match",
+      influencedNumbers: false,
+    } : null,
+    narration: narration ? {
+      source: narration.source,
+      numbersChecked: narration.guard?.checked ?? 0,
+      numbersRejected: narration.guard?.violations?.length ?? 0,
+      note: narration.reason || null,
+    } : null,
     chainPrev,
     timestamp: new Date(at).toISOString(),
   };
@@ -222,6 +240,10 @@ export async function buildRecord({
     contentHash: body.dataset.contentHash,
     question, intent: intent || null, grain, period, agent: agent || null,
     engine: ENGINE_STAMP,
+    // Schema interpretation and attached context both change what the answer
+    // means, so both belong in the identity. Same question on the same file
+    // with a different time axis is not the same analysis.
+    skillHash, contextHash: context?.docHash || null,
   }));
   const recordHash = await hash(canonical({ ...body, identity: identity.hex }));
 
@@ -313,6 +335,14 @@ export function journalToMarkdown(journal) {
     }
     if (r.multiplicity) {
       lines.push(`- Multiplicity: ${r.multiplicity.testsRun} tests run, ${r.multiplicity.survived} survived at q ≤ ${r.multiplicity.fdrThreshold} (Benjamini-Hochberg)`);
+    }
+    if (r.skillHash) lines.push(`- Schema interpretation (skill hash): \`${r.skillHash.slice(0, 16)}…\``);
+    if (r.context) {
+      lines.push(`- Context consulted: ${r.context.source} — ${r.context.entriesConsulted.join(", ") || "none"} (${r.context.retrievedBy}); did not contribute to any number`);
+    }
+    if (r.narration) {
+      lines.push(`- Narration: ${r.narration.source}, ${r.narration.numbersChecked} number(s) verified against engine output` +
+        (r.narration.numbersRejected ? `, ${r.narration.numbersRejected} rejected` : ""));
     }
     if (r.result?.summary) { lines.push(""); lines.push(`> ${r.result.summary}`); }
     lines.push("");

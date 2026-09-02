@@ -15,12 +15,25 @@
   "scripts": {
     "start": "react-scripts start",
     "build": "CI=false react-scripts build",
-    "test": "node tests/run.mjs",
-    "test:engine": "node tests/run.mjs"
+    "test": "node tests/run.mjs && node tests/run-context.mjs",
+    "test:engine": "node tests/run.mjs",
+    "test:context": "node tests/run-context.mjs"
   },
   "browserslist": {
-    "production": [">0.2%", "not dead", "not op_mini all"],
-    "development": ["last 1 chrome version", "last 1 firefox version", "last 1 safari version"]
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
   },
-  "eslintConfig": { "extends": ["react-app"] }
+  "eslintConfig": {
+    "extends": [
+      "react-app"
+    ]
+  }
 }

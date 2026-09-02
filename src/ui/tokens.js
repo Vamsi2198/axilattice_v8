@@ -29,6 +29,14 @@ export const CLASS_COLOR = {
 
 /* Evidence tiers drive one colour decision across the whole app, so a reader
    learns the vocabulary once. */
+/* Priority tiers for the connect feed. The colour carries the evidence
+   standard, so a reader learns the vocabulary once and it holds everywhere. */
+export const PRIORITY = {
+  high:   { color: T.red,     label: "HIGH",   note: "survives correction at q ≤ 0.01 with a material effect" },
+  medium: { color: T.amber,   label: "MEDIUM", note: "survives correction at q ≤ 0.10" },
+  low:    { color: T.textMid, label: "LOW",    note: "does not clear correction, or carries no applicable test" },
+};
+
 export const TIER = {
   strong:      { color: T.green,   label: "SURVIVES CORRECTION" },
   weak:        { color: T.amber,   label: "LOW POWER" },
@@ -63,7 +71,17 @@ export function fmtSci(v, digits = 3) {
 export const GLOBAL_CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@300;400;500;600&display=swap');
   *{box-sizing:border-box;margin:0;padding:0}
+  /* The deployed build scrolled sideways on a phone and iOS then inflated the
+     type to match the wider layout, so every screen read as zoomed-in with
+     text clipped at both edges. Three causes, all fixed here: unbounded
+     document width, iOS text auto-inflation, and long hashes that refuse to
+     wrap. */
+  html,body{max-width:100%;overflow-x:hidden;-webkit-text-size-adjust:100%;text-size-adjust:100%}
   body{background:${T.bg0};-webkit-font-smoothing:antialiased}
+  /* Flex and grid children default to min-width:auto, which lets a long
+     unbroken string push a card wider than the screen. */
+  .ax-card,.ax-cell{min-width:0;max-width:100%}
+  .ax-wrap{overflow-wrap:anywhere;word-break:break-word;min-width:0}
   @keyframes spin{to{transform:rotate(360deg)}}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
   @keyframes mic-ring{0%,100%{box-shadow:0 0 0 4px ${T.amber}22}50%{box-shadow:0 0 0 12px ${T.amber}08}}

@@ -58,6 +58,65 @@ const fmt = (v, d = 2) =>
 
 function pct(x, d = 1) { return x == null ? "—" : `${(x * 100).toFixed(d)}%`; }
 
+/* ─── THE CONNECT FEED ───────────────────────────────────────────────────── */
+
+/**
+ * Build the ranked card feed produced the moment a dataset connects.
+ *
+ * This is what the Scan agent SHOULD have been doing. It was returning one
+ * card holding the top three findings in a `findings` array the UI never
+ * rendered — so an engine that had located 26 real, corrected findings
+ * displayed exactly one card. The insights were there the whole time; the
+ * display layer threw them away.
+ *
+ * Each finding now becomes its own card, tagged with its priority tier, so
+ * the feed can be read top-down and the evidence standard travels with the
+ * card rather than living in a summary paragraph.
+ */
+export function buildFeed(cube, options = {}) {
+  const res = discoverInsights(cube, options);
+  const { grain, period } = res;
+
+  const cards = res.feed.map((f, i) => {
+    const chart = chartFor(cube, f, grain, period);
+    const subject = f.kind === "cross"
+      ? `${f.dimA} = ${f.a} × ${f.dimB} = ${f.b}`
+      : `${f.dim} = ${f.value}`;
+    const dir = f.direction === "below" ? "below" : "above";
+    const verb = {
+      sibling: `runs ${dir} its peers on`,
+      temporal: "broke from its own history on",
+      persistence: f.extreme === "bottom" ? "is consistently the lowest on" : "is consistently the highest on",
+      cross: `averages ${dir} the rest of the data on`,
+    }[f.kind] || "is notable on";
+
+    return {
+      kind: "card",
+      id: `feed-${i}-${f.kind}`,
+      agent: "scan",
+      fromFeed: true,
+      tier: f.tier,
+      tierReason: f.tierReason,
+      title: `${subject} ${verb} ${f.measure}`,
+      insightClass: classifyInsight(f),
+      measure: f.measure,
+      dimension: f.dim || f.dimA || null,
+      grain, period,
+      chart_type: chart.type,
+      chart_data: chart.data,
+      highlight: [f.value, f.a].filter(Boolean),
+      kpi: f.val ?? null,
+      delta: f.pctChange ?? null,
+      summary: f.why,
+      corroboration: f.corroboration || [],
+      evidence: f,
+      audit: res.audit,
+    };
+  });
+
+  return { cards, audit: res.audit, tierCounts: res.tierCounts, grain, period };
+}
+
 /* ─── AGENT 1: SCAN ──────────────────────────────────────────────────────── */
 
 export async function agentScan(cube, intent, onStep, opts = {}) {

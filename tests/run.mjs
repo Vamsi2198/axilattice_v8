@@ -134,13 +134,44 @@ section("4. Multiplicity control (v7 had none — top-6-by-score on noise)");
   const { cube } = await loadDataset(csv, { fileName: "null.csv" });
   const res = discoverInsights(cube);
   console.log(`      ${res.audit.verdict}`);
-  ok("reports ZERO findings on a dataset with no planted effect",
-    res.insights.length === 0, `reported ${res.insights.length}: ${res.insights.slice(0, 3).map((i) => i.why).join(" | ")}`);
   ok("still says how many tests were run", res.audit.testsRun > 20, `${res.audit.testsRun}`);
+
+  /* CALIBRATION, not a single-seed zero.
+   *
+   * This assertion used to be "exactly zero findings on the null dataset",
+   * which is a deterministic claim about a probabilistic guarantee. BH at
+   * q <= 0.10 on data with no signal controls the family-wise error rate at
+   * 0.10 -- so roughly one null dataset in ten SHOULD produce a finding. The
+   * old assertion passed only because the cross-cell test it ran against was
+   * underspecified and underpowered; replacing it with a correct Welch test
+   * raised power, and a seed promptly landed in that 1-in-10.
+   *
+   * Tuning the engine to make one seed return zero would have been hiding a
+   * correct result. The right test measures the RATE across many seeds and
+   * checks it against the level we claim. */
+  let withAny = 0, totalFindings = 0, highTier = 0;
+  const NULL_SEEDS = 20;
+  for (let seed = 1; seed <= NULL_SEEDS; seed++) {
+    const n = gen.nullDataset({ months: 20, perMonth: 350, seed });
+    const L = await loadDataset(n.csv, { fileName: "n.csv" });
+    const r = discoverInsights(L.cube);
+    if (r.insights.length) withAny++;
+    totalFindings += r.insights.length;
+    highTier += r.feed.filter((f) => f.tier === "high").length;
+  }
+  const rate = withAny / NULL_SEEDS;
+  console.log(`      ${withAny}/${NULL_SEEDS} null datasets produced a finding (${(rate * 100).toFixed(0)}%) against a nominal 10%`);
+  ok("false-positive rate on null data is consistent with the q <= 0.10 level",
+    rate <= 0.30, `${(rate * 100).toFixed(0)}% over ${NULL_SEEDS} seeds`);
+  ok("mean findings per null dataset is below 1", totalFindings / NULL_SEEDS < 1,
+    `${(totalFindings / NULL_SEEDS).toFixed(2)}`);
+  ok("NOTHING from null data ever reaches the HIGH priority tier",
+    highTier === 0, `${highTier} high-tier findings on pure noise`);
 
   // What v7's scoring would have done on the same data.
   let v7Would = 0;
   const grain = res.grain, period = res.period;
+  const v8Reported = res.insights.length;
   for (const m of cube.meta.measures) {
     for (const d of cube.meta.dims) {
       const bd = queryBreakdown(cube, d.col, m.col, grain, period);
@@ -161,8 +192,8 @@ section("4. Multiplicity control (v7 had none — top-6-by-score on noise)");
     }
   }
   console.log(`      v7's scoring would have surfaced ${v7Would} "insights" from this pure-noise file`);
-  ok("v8 reports fewer findings on noise than v7 would have", res.insights.length < v7Would,
-    `v8=${res.insights.length} v7=${v7Would}`);
+  ok("v8 reports far fewer findings on noise than v7 would have", v8Reported * 4 < v7Would,
+    `v8=${v8Reported} v7=${v7Would}`);
 }
 
 /* ═══ 5. SUPPORT GUARDS ══════════════════════════════════════════════════ */
