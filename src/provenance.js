@@ -71,8 +71,11 @@ function fnv1a(str) {
 }
 
 function subtle() {
-  if (typeof globalThis !== "undefined" && globalThis.crypto && globalThis.crypto.subtle) {
-    return globalThis.crypto.subtle;
+  /* globalThis exists in browsers and Node, but CRA's browser env doesn't list it. */
+  // eslint-disable-next-line no-undef
+  const g = globalThis;
+  if (g && g.crypto && g.crypto.subtle) {
+    return g.crypto.subtle;
   }
   return null;
 }
